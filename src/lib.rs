@@ -5,7 +5,10 @@ pub mod wal;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hash::fnv1a64;
@@ -37,9 +40,18 @@ fn wal_path(dir: &std::path::Path, i: usize) -> PathBuf {
     dir.join(format!("shard-{i}.wal"))
 }
 
+fn expired(e: &Entry, now: u64) -> bool {
+    match e.expires_at_ms {
+        Some(t) => t <= now,
+        None => false,
+    }
+}
+
 pub struct Store {
-    shards: Vec<Mutex<ShardInner>>,
+    shards: Arc<Vec<Mutex<ShardInner>>>,
     sync: SyncPolicy,
+    stop: Arc<AtomicBool>,
+    sweeper: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Store {
@@ -47,13 +59,13 @@ impl Store {
         assert!(cfg.shards > 0, "shards must be >= 1");
         fs::create_dir_all(&cfg.dir)?;
 
-        // meta file remembers shard count so keys map to the same shard after restart
         let meta = cfg.dir.join("meta");
         if meta.exists() {
             let s = fs::read_to_string(&meta)?;
-            let n: usize = s.trim().parse().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "bad meta file")
-            })?;
+            let n: usize = s
+                .trim()
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad meta file"))?;
             if n != cfg.shards {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -64,7 +76,7 @@ impl Store {
             fs::write(&meta, cfg.shards.to_string())?;
         }
 
-        let mut shards = Vec::with_capacity(cfg.shards);
+        let mut inner = Vec::with_capacity(cfg.shards);
         for i in 0..cfg.shards {
             let path = wal_path(&cfg.dir, i);
             let mut map = std::collections::HashMap::new();
@@ -72,7 +84,6 @@ impl Store {
             if path.exists() {
                 let bytes = fs::read(&path)?;
                 let (recs, valid_len) = read_valid(&bytes);
-                // cut off torn tail
                 let f = OpenOptions::new().write(true).open(&path)?;
                 f.set_len(valid_len as u64)?;
                 let now = now_ms();
@@ -95,9 +106,48 @@ impl Store {
 
             let f = OpenOptions::new().create(true).append(true).open(&path)?;
             let wal = std::io::BufWriter::new(f);
-            shards.push(Mutex::new(ShardInner { map, wal }));
+            inner.push(Mutex::new(ShardInner { map, wal }));
         }
-        Ok(Store { shards, sync: cfg.sync })
+
+        let shards = Arc::new(inner);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sync = cfg.sync;
+
+        // background sweeper: every 200ms clean one shard at a time
+        let t_shards = Arc::clone(&shards);
+        let t_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut ticks = 0;
+            while !t_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                if t_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let now = now_ms();
+                for s in t_shards.iter() {
+                    if let Ok(mut g) = s.lock() {
+                        g.map.retain(|_, e| !expired(e, now));
+                    }
+                }
+                // EverySecond mode syncs about once a second
+                ticks += 1;
+                if sync == SyncPolicy::EverySecond && ticks % 5 == 0 {
+                    for s in t_shards.iter() {
+                        if let Ok(mut g) = s.lock() {
+                            let _ = g.wal.flush();
+                            let _ = g.wal.get_ref().sync_data();
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Store {
+            shards,
+            sync,
+            stop,
+            sweeper: Mutex::new(Some(handle)),
+        })
     }
 
     fn pick(&self, key: &str) -> usize {
@@ -114,8 +164,13 @@ impl Store {
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let idx = self.pick(key);
-        let guard = self.shards[idx].lock().unwrap();
-        guard.map.get(key).map(|e| e.value.clone())
+        let mut guard = self.shards[idx].lock().unwrap();
+        let e = guard.map.get(key)?;
+        if expired(e, now_ms()) {
+            guard.map.remove(key);
+            return None;
+        }
+        Some(e.value.clone())
     }
 
     pub fn set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> io::Result<()> {
@@ -123,7 +178,6 @@ impl Store {
         let mut guard = self.shards[idx].lock().unwrap();
         let expires_at_ms = ttl.map(|d| now_ms().saturating_add(d.as_millis() as u64));
         let bytes = encode_set(key, value, expires_at_ms);
-        // log first, if this fails we don't touch the map
         guard.wal.write_all(&bytes)?;
         Self::sync_one(&mut guard.wal, self.sync)?;
         guard.map.insert(
@@ -147,7 +201,7 @@ impl Store {
 
     pub fn len(&self) -> usize {
         let mut total = 0;
-        for s in &self.shards {
+        for s in self.shards.iter() {
             total += s.lock().unwrap().map.len();
         }
         total
@@ -156,7 +210,13 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        for s in &self.shards {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Ok(mut h) = self.sweeper.lock() {
+            if let Some(j) = h.take() {
+                let _ = j.join();
+            }
+        }
+        for s in self.shards.iter() {
             if let Ok(mut g) = s.lock() {
                 let _ = g.wal.flush();
             }
