@@ -1,0 +1,10 @@
+[package]
+name = "minikv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crc32fast = "1.4"  # needed in M2 for WAL records (not used in M1)
+
+[dev-dependencies]
+tempfile = "3"
